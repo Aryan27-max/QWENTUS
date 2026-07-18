@@ -5,8 +5,7 @@ from __future__ import annotations
 import copy
 import logging
 from pathlib import Path
-
-from rich.logging import RichHandler
+from typing import Callable
 
 
 class ConciseConsoleHandler(logging.StreamHandler):
@@ -20,7 +19,17 @@ class ConciseConsoleHandler(logging.StreamHandler):
         super().emit(record_copy)
 
 
-def configure_logging(log_dir: Path) -> logging.Logger:
+_console_handler_factory: Callable[[], logging.Handler] | None = None
+
+
+def set_console_handler_factory(factory: Callable[[], logging.Handler] | None) -> None:
+    """Register a factory used to build the console handler for Atlas logs."""
+
+    global _console_handler_factory
+    _console_handler_factory = factory
+
+
+def configure_logging(log_dir: Path, console_handler: logging.Handler | None = None) -> logging.Logger:
     """Configure console and file logging for the application."""
 
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -37,7 +46,10 @@ def configure_logging(log_dir: Path) -> logging.Logger:
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
     file_handler.setFormatter(formatter)
 
-    console_handler = ConciseConsoleHandler()
+    if console_handler is None and _console_handler_factory is not None:
+        console_handler = _console_handler_factory()
+    if console_handler is None:
+        console_handler = ConciseConsoleHandler()
     console_handler.setFormatter(formatter)
 
     logger.addHandler(file_handler)

@@ -9,6 +9,7 @@ import shutil
 import time
 from pathlib import Path
 from typing import Iterable
+import threading
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -208,7 +209,6 @@ class AtlasPipeline:
                 self._render_dashboard(records, stats, current_pdf=outcome.pdf_path.name, current_index=index, latest_timings={"ocr_used": 0.0, "total": 0.0})
                 continue
             record = self._to_record(outcome.evaluation)
-            record.processing_time_seconds = 0.0
             records.append(record)
             records.sort(key=lambda item: item.overall_score, reverse=True)
             for rank, ranked_record in enumerate(records, start=1):
@@ -296,30 +296,42 @@ class AtlasPipeline:
             return self.config.paths.maybe
         return self.config.paths.rejected
 
-    def _move_pdf(self, source: Path, destination_dir: Path) -> None:
+    def _move_pdf(self, source: Path, destination_dir: Path) -> bool:
         """Move the processed PDF into the final decision folder."""
 
         destination_dir.mkdir(parents=True, exist_ok=True)
         target = destination_dir / source.name
-        delays = [0, 1, 2]
-        last_error: Exception | None = None
-        for attempt, delay in enumerate(delays, start=1):
-            if delay:
-                time.sleep(delay)
+        if not source.exists():
+            self.logger.warning("PDF already moved or unavailable. Resume evaluation already completed. Skipping file move.")
+            return False
+        if target.exists():
             try:
-                if target.exists():
-                    target.unlink()
+                target.unlink()
+            except (PermissionError, OSError):
+                self.logger.warning("Destination already exists for %s. Skipping file replacement.", source.name)
+                return False
+        delays = [0.5, 0.5, 0.5]
+        for attempt in range(4):
+            if attempt:
+                time.sleep(delays[attempt - 1])
+            try:
                 shutil.move(str(source), str(target))
                 self.logger.info("Moved %s to %s", source.name, destination_dir.name)
-                return
-            except (PermissionError, OSError) as exc:
-                last_error = exc
-                if attempt < len(delays):
+                return True
+            except FileNotFoundError:
+                self.logger.warning("PDF already moved or unavailable. Resume evaluation already completed. Skipping file move.")
+                return False
+            except PermissionError as exc:
+                if attempt < 3:
                     continue
-                self.logger.exception("Failed to move %s to %s after retries: %s", source.name, destination_dir.name, exc)
-                raise
-        if last_error is not None:
-            raise last_error
+                self.logger.warning("Failed to move %s to %s after retries: %s", source.name, destination_dir.name, exc)
+                return False
+            except OSError as exc:
+                if attempt < 3 and getattr(exc, "winerror", None) in {5, 32}:
+                    continue
+                self.logger.warning("Failed to move %s to %s after retries: %s", source.name, destination_dir.name, exc)
+                return False
+        return False
 
     def _render_dashboard(self, records: list[ScreeningRecord], stats: PipelineStats, current_pdf: str, current_index: int, latest_record: ScreeningRecord | None = None, latest_timings: dict[str, float] | None = None) -> None:
         total = stats.total or max(current_index, 1)
@@ -354,8 +366,18 @@ class AtlasPipeline:
             "portfolio": record.portfolio_url,
         }.get(source, "")
         if not value:
-            return f"⚠ {source.title()} Missing"
-        return f"✓ {source.title()} Parsed"
+            labels = {
+                "github": "GitHub unavailable",
+                "linkedin": "LinkedIn unavailable",
+                "portfolio": "Portfolio unavailable",
+            }
+            return f"⚠ {labels.get(source, source.title() + ' unavailable')}"
+        labels = {
+            "github": "GitHub Parsed",
+            "linkedin": "LinkedIn Parsed",
+            "portfolio": "Portfolio Parsed",
+        }
+        return f"✓ {labels.get(source, source.title() + ' Parsed')}"
 
     def _iter_pdf_paths(self, folder: Path) -> Iterable[Path]:
         return sorted(path for path in folder.glob("*.pdf") if path.is_file())
@@ -401,20 +423,24 @@ class AtlasPipeline:
 class _ResumeWatchHandler(FileSystemEventHandler):
     """Watchdog bridge that funnels new PDFs into the pipeline."""
 
-    def __init__(self, queue, logger: logging.Logger) -> None:
+    def __init__(self, queue, logger: logging.Logger, should_queue=None) -> None:
         self.queue = queue
         self.logger = logger
+        self.should_queue = should_queue
 
     def on_created(self, event) -> None:  # type: ignore[override]
         if getattr(event, "is_directory", False):
             return
         path = Path(event.src_path)
         if path.suffix.lower() == ".pdf":
+            if self.should_queue is not None and not self.should_queue(path):
+                self.logger.info("Skipping duplicate resume event %s", path.name)
+                return
             self.logger.info("Queued new resume %s", path.name)
             self.queue.put(path)
 
 
-def run_watch_mode(config: AtlasConfig) -> int:
+def run_watch_mode(config: AtlasConfig, completion_callback=None) -> int:
     """Monitor Incoming for new resumes and process them one-by-one."""
 
     import queue as queue_module
@@ -434,7 +460,29 @@ def run_watch_mode(config: AtlasConfig) -> int:
     from core.queue import ResumePathQueue
 
     resume_queue = ResumePathQueue()
-    handler = _ResumeWatchHandler(resume_queue, logger)
+    state_lock = threading.Lock()
+    queued_signatures: set[tuple[str, int, int]] = set()
+    active_signatures: set[tuple[str, int, int]] = set()
+    completed_signatures: set[tuple[str, int, int]] = set()
+
+    def _signature(path: Path) -> tuple[str, int, int] | None:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        return (path.name, stat.st_size, stat.st_mtime_ns)
+
+    def _should_queue(path: Path) -> bool:
+        signature = _signature(path)
+        if signature is None:
+            return False
+        with state_lock:
+            if signature in queued_signatures or signature in active_signatures or signature in completed_signatures:
+                return False
+            queued_signatures.add(signature)
+            return True
+
+    handler = _ResumeWatchHandler(resume_queue, logger, _should_queue)
     observer = Observer()
     observer.schedule(handler, str(config.paths.incoming), recursive=False)
     observer.start()
@@ -442,41 +490,79 @@ def run_watch_mode(config: AtlasConfig) -> int:
 
     stats = PipelineStats(total=0)
     records: list[ScreeningRecord] = []
+    last_completion_index = 0
     try:
         initial_paths = sorted(config.paths.incoming.glob("*.pdf"))
         stats.total = len(initial_paths)
         for path in initial_paths:
-            resume_queue.put(path)
+            if _should_queue(path):
+                resume_queue.put(path)
         current_index = 0
         while True:
             try:
                 path = resume_queue.get(timeout=1.0)
             except queue_module.Empty:
+                if completion_callback is not None and current_index > last_completion_index:
+                    summary = RunSummary(
+                        processed=len(records),
+                        shortlisted=stats.shortlisted,
+                        maybe=stats.maybe,
+                        rejected=stats.rejected,
+                        failed=stats.failed,
+                        report_file=str(config.paths.workbook),
+                    )
+                    completion_callback(summary)
+                    last_completion_index = current_index
                 continue
+            signature = _signature(path)
+            if signature is None:
+                logger.warning("PDF already moved or unavailable. Resume evaluation already completed. Skipping file move.")
+                continue
+            with state_lock:
+                if signature in active_signatures or signature in completed_signatures:
+                    logger.info("Skipping duplicate resume event for %s", path.name)
+                    continue
+                active_signatures.add(signature)
             current_index += 1
             stats.total = max(stats.total, current_index)
-            outcome = pipeline._process_pdf(path)
-            if outcome.evaluation is None:
-                stats.update(None, {"total": 0.0, "llm": 0.0, "ocr": 0.0}, failed=True)
-                pipeline._move_pdf(outcome.pdf_path, config.paths.failed)
+            try:
+                outcome = pipeline._process_pdf(path)
+                if outcome.evaluation is None:
+                    stats.update(None, {"total": 0.0, "llm": 0.0, "ocr": 0.0}, failed=True)
+                    pipeline.exporter.export(records, stats)
+                    pipeline._move_pdf(outcome.pdf_path, config.paths.failed)
+                    pipeline._render_dashboard(records, stats, current_pdf=path.name, current_index=current_index, latest_timings={"ocr_used": 0.0, "total": 0.0})
+                    continue
+                record = pipeline._to_record(outcome.evaluation)
+                records.append(record)
+                records.sort(key=lambda item: item.overall_score, reverse=True)
+                for rank, ranked_record in enumerate(records, start=1):
+                    ranked_record.rank = rank
+                destination = pipeline._destination_for_record(record)
+                timings = dict(outcome.evaluation.timings)
+                timings["scrape"] = sum(timings.get(key, 0.0) for key in ("github", "linkedin", "portfolio"))
+                record.processing_time_seconds = sum(timings.get(key, 0.0) for key in ("pdf", "ocr", "github", "linkedin", "portfolio", "llm"))
+                timings["total"] = record.processing_time_seconds
+                stats.update(record, timings, failed=False)
                 pipeline.exporter.export(records, stats)
-                pipeline._render_dashboard(records, stats, current_pdf=path.name, current_index=current_index, latest_timings={"ocr_used": 0.0, "total": 0.0})
-                continue
-            record = pipeline._to_record(outcome.evaluation)
-            records.append(record)
-            records.sort(key=lambda item: item.overall_score, reverse=True)
-            for rank, ranked_record in enumerate(records, start=1):
-                ranked_record.rank = rank
-            destination = pipeline._destination_for_record(record)
-            folder_started = time.perf_counter()
-            pipeline._move_pdf(outcome.pdf_path, destination)
-            folder_time = time.perf_counter() - folder_started
-            timings = dict(outcome.evaluation.timings)
-            timings["folder"] = folder_time
-            timings["total"] = sum(timings.get(key, 0.0) for key in ("pdf", "ocr", "github", "linkedin", "portfolio", "llm", "folder"))
-            stats.update(record, timings, failed=False)
-            pipeline.exporter.export(records, stats)
-            pipeline._render_dashboard(records, stats, current_pdf=path.name, current_index=current_index, latest_record=record, latest_timings=timings)
+                pipeline._checkpoint[record.resume_file] = {"decision": record.decision, "destination": destination.name}
+                pipeline._save_checkpoint()
+                folder_started = time.perf_counter()
+                moved = pipeline._move_pdf(outcome.pdf_path, destination)
+                folder_time = time.perf_counter() - folder_started
+                timings["folder"] = folder_time
+                record.processing_time_seconds += folder_time
+                timings["total"] = record.processing_time_seconds
+                stats.total_processing_time += folder_time
+                stats.total_move_time += folder_time
+                stats.minimum_total_time = min(stats.minimum_total_time, record.processing_time_seconds)
+                stats.maximum_total_time = max(stats.maximum_total_time, record.processing_time_seconds)
+                pipeline._render_dashboard(records, stats, current_pdf=path.name, current_index=current_index, latest_record=record, latest_timings=timings)
+            finally:
+                with state_lock:
+                    active_signatures.discard(signature)
+                    completed_signatures.add(signature)
+
     except KeyboardInterrupt:
         logger.info("Atlas watch mode stopped by user.")
     finally:

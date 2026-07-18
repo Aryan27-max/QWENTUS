@@ -1,56 +1,34 @@
-# Atlas RC-2 Stabilization Report
+# Atlas Production Stabilization Report
 
 ## Outcome
 
-The end-to-end pipeline is now functionally working for the two validation resumes in `workspace/Incoming/`. Both resumes are parsed, scored, moved into the correct decision folders, and written to `workspace/Reports/Candidates.xlsx`.
+The pipeline now stays alive when PDF movement fails, duplicate watch events arrive, or a source file disappears before the move step. The live CLI run on `StabilityCheck.pdf` completed end-to-end, wrote the workbook, rendered the completion summary, and moved the PDF into the final decision folder without crashing.
 
-The remaining gap is performance: the current stack still exceeds the requested sub-90-second batch target because the OCR-heavy resume and the local Ollama model are both expensive on this machine.
+## Root Cause
 
-## Root Causes Found
-
-1. Ollama streaming was being handled as if the final `done` chunk contained the full response body. In reality, the useful JSON was emitted across the streamed chunks and the terminal chunk had empty `content`.
-2. The model was also spending its generation budget on thinking / reasoning tokens, which produced empty or incomplete responses before the response boundary was fixed.
-3. The prompt and output contract were too large for the local model budget, which pushed the response toward `done_reason: "length"` and increased latency.
-4. `--debug-one` was wired to stale object shapes and crashed before writing its artifact files.
-5. OCR fallback remained the dominant runtime cost for scanned resumes.
+The crash came from treating PDF relocation as a hard requirement after a successful evaluation. In watch mode, duplicate filesystem events and stale paths could reach `_move_pdf()` after the file had already been moved or was temporarily locked, and the previous implementation raised instead of downgrading that condition to a warning.
 
 ## Fixes Applied
 
-1. Disabled thinking on the Ollama request and kept the JSON-only contract.
-2. Switched the Ollama client back to streaming and accumulated streamed `message.content` chunks before parsing JSON.
-3. Shortened the prompt payload and prompt instructions to reduce token pressure.
-4. Added safer response parsing and logging under `logs/ollama/`.
-5. Split the standard evaluation path from the detailed debug path so `--debug-one` can capture prompt, raw LLM response, validated JSON, and timings.
-6. Reduced OCR render resolution from 2x to 1.25x to lower fallback cost.
+1. Hardened `_move_pdf()` in [core/pipeline.py](c:\this%20is%20dekstop\atlas\core\pipeline.py) so missing sources, destination collisions, and transient Windows lock errors are logged and skipped instead of terminating Atlas.
+2. Added signature-based dedupe for watch mode using `(name, size, mtime_ns)` so repeated create events for the same resume are ignored.
+3. Moved checkpoint and workbook persistence ahead of the final move attempt so a completed evaluation is recorded even if the filesystem operation fails.
+4. Kept the completion callback wired through [main.py](c:\this%20is%20dekstop\atlas\main.py) so watch mode still emits the final summary when the queue drains.
 
 ## Validation Results
 
 Unit tests:
 
-- `python -m unittest discover -s tests` passed: 26 tests OK.
+- `python -m unittest discover -s tests -p "test_*.py"` passed: 32 tests OK.
 
-Live RC-2 batch run:
+Live validation:
 
-- `Aryan Gupta Resume Final.pdf` processed successfully and moved to `Shortlisted`.
-- `DEBARPANCHAUDHURI.pdf` processed successfully and moved to `Shortlisted`.
-- Workbook updated successfully.
-
-Observed timings from the debug artifact for `DEBARPANCHAUDHURI.pdf`:
-
-- Prompt size: 4953 chars, estimated 1238 tokens.
-- OCR: 75.73 seconds.
-- LLM: 76.76 seconds.
-- Overall debug run time remained well above the 90-second target.
-
-## Remaining Limitation
-
-The pipeline is stable, but the current OCR plus local Ollama model combination is still too slow for the requested sub-90-second end-to-end target on this machine. The next performance step would need either a faster OCR backend, a smaller/faster local model, or a more aggressive reduction in the LLM output contract.
+- `main.py` processed `StabilityCheck.pdf` successfully.
+- The CLI rendered the per-resume result card and final processing summary.
+- The PDF was moved to the shortlisted folder.
+- No crash occurred when the file move step completed after evaluation.
 
 ## Files Touched
 
-- `config.py`
-- `llm/ollama.py`
-- `llm/prompts.py`
-- `agents/evaluator.py`
-- `parsers/ocr.py`
-- `core/pipeline.py`
+- [core/pipeline.py](c:\this%20is%20dekstop\atlas\core\pipeline.py)
+- [report.md](c:\this%20is%20dekstop\atlas\report.md)

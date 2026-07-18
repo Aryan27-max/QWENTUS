@@ -1,0 +1,1 @@
+"""Console presentation helpers for Atlas."""
