@@ -1,3 +1,5 @@
+<img width="1330" height="434" alt="image" src="https://github.com/user-attachments/assets/fc002732-63f4-4ceb-b584-f05b23cd1e76" />
+
 # QWENTUS
 
 > **Offline AI Resume Screening System powered by Ollama + Qwen3:8B**
