@@ -454,6 +454,7 @@ def run_watch_mode(config: AtlasConfig, completion_callback=None) -> int:
         ollama.ensure_ready()
     except Exception as exc:
         logger.error(str(exc))
+        ollama.close()
         return 1
 
     pipeline = AtlasPipeline(config=config, ollama=ollama, logger=logger)
@@ -568,4 +569,5 @@ def run_watch_mode(config: AtlasConfig, completion_callback=None) -> int:
     finally:
         observer.stop()
         observer.join()
+        ollama.close()
     return 0

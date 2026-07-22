@@ -31,11 +31,11 @@ def run_once(args: argparse.Namespace | None = None, ui: AtlasTerminalUI | None 
     config = DEFAULT_CONFIG
     config.ensure_directories()
     logger = configure_logging(config.paths.logs)
-    client = OllamaClient(config)
-    pipeline = AtlasPipeline(config=config, ollama=client, logger=logger)
-    if args and args.debug_one:
-        return pipeline.run_debug_one(args.debug_one)
-    summary = pipeline.run_once()
+    with OllamaClient(config) as client:
+        pipeline = AtlasPipeline(config=config, ollama=client, logger=logger)
+        if args and args.debug_one:
+            return pipeline.run_debug_one(args.debug_one)
+        summary = pipeline.run_once()
     if ui is not None:
         ui.show_completion(summary)
     else:

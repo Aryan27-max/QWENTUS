@@ -33,6 +33,20 @@ class OllamaClientTests(unittest.TestCase):
         payload = client.evaluate_json("test prompt")
         self.assertEqual(payload["recommendation"], "Maybe")
 
+    def test_close_closes_underlying_session(self) -> None:
+        config = AtlasConfig()
+        client = OllamaClient(config)
+        client._session.close = MagicMock()
+        client.close()
+        client._session.close.assert_called_once_with()
+
+    def test_context_manager_closes_session(self) -> None:
+        config = AtlasConfig()
+        with OllamaClient(config) as client:
+            client._session.close = MagicMock()
+            session_close = client._session.close
+        session_close.assert_called_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()

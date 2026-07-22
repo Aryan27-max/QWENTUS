@@ -30,6 +30,17 @@ class OllamaClient:
         self._log_dir = self.config.paths.logs / "ollama"
         self._log_dir.mkdir(parents=True, exist_ok=True)
 
+    def close(self) -> None:
+        """Release the underlying HTTP session."""
+
+        self._session.close()
+
+    def __enter__(self) -> OllamaClient:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
     def health_check(self) -> OllamaHealth:
         """Verify that Ollama is reachable and the requested model exists."""
 
